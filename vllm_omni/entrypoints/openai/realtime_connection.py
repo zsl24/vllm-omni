@@ -15,6 +15,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.utils import coerce_param_message_types
+from vllm_omni.utils.audio import apply_hann_fade_to_chunk
 
 logger = init_logger(__name__)
 
@@ -30,6 +31,7 @@ class RealtimeConnection(VllmRealtimeConnection):
         super().__init__(*args, **kwargs)
         self.engine = cast(AsyncOmni, self.serving.engine_client)
         self._realtime_audio_ref: np.ndarray | None = None
+        self._audio_first_chunk: bool = True
 
     async def start_generation(self):
         await super().start_generation()
@@ -129,6 +131,7 @@ class RealtimeConnection(VllmRealtimeConnection):
         prompt_token_ids_len = 0
         completion_tokens_len = 0
         self._realtime_audio_ref = None
+        self._audio_first_chunk = True
 
         # Coerce cumulative outputs to delta outputs; this ensures
         # we don't emit redundant MM data & drain after emitting.
@@ -169,6 +172,12 @@ class RealtimeConnection(VllmRealtimeConnection):
                 audio_chunks, sample_rate = self._extract_audio_chunks(output)
 
                 for chunk in audio_chunks:
+                    # Apply Hann-window fade to eliminate boundary pops
+                    chunk = apply_hann_fade_to_chunk(
+                        chunk=chunk,
+                        is_first_chunk=self._audio_first_chunk,
+                    )
+                    self._audio_first_chunk = False
                     sent_audio = True
                     await self.send_json(
                         {

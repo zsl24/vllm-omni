@@ -119,7 +119,7 @@ from vllm_omni.entrypoints.openai.utils import (
 from vllm_omni.errors import OmniClientError
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
-from vllm_omni.utils.audio import audio_chunk_pcm_bytes, audio_chunk_sample_rate
+from vllm_omni.utils.audio import apply_hann_fade_to_chunk, audio_chunk_pcm_bytes, audio_chunk_sample_rate
 
 logger = init_logger(__name__)
 
@@ -1891,7 +1891,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         )
 
                     role = self.get_chat_request_role(request)
-                    choices_data = self._create_audio_choice(omni_res, role, request, stream=True)
+                    choices_data = self._create_audio_choice(omni_res, role, request, stream=True, req_state=req_state)
                     # Only emit finish_reason on the last modality to
                     # comply with OpenAI streaming spec.
                     for choice in choices_data:
@@ -2477,7 +2477,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         return choices, usage, prompt_logprobs, prompt_token_ids, kv_transfer_params
 
     def _create_audio_choice(
-        self, omni_outputs: OmniRequestOutput, role: str, request: ChatCompletionRequest, stream: bool = False
+        self, omni_outputs: OmniRequestOutput, role: str, request: ChatCompletionRequest, stream: bool = False,
+        req_state: Any = None,
     ):
         choices: list[ChatCompletionResponseChoice] = []
         final_res = omni_outputs.request_output
@@ -2501,6 +2502,19 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # Ensure audio is 1D (flatten if needed)
         if audio_tensor.ndim > 1:
             audio_tensor = audio_tensor.flatten()
+
+        # Apply Hann-window fade for streaming audio to eliminate
+        # boundary pops/clicks between consecutive chunks.
+        is_last_chunk = any(
+            o.finish_reason is not None for o in final_res.outputs
+        )
+        if stream and req_state is not None:
+            audio_tensor = apply_hann_fade_to_chunk(
+                chunk=audio_tensor,
+                is_first_chunk=req_state.audio_first_chunk,
+                is_last_chunk=is_last_chunk,
+            )
+            req_state.audio_first_chunk = False
 
         # Prefer the talker-reported sample rate when present. Qwen3-Omni
         # omits "sr" and runs at 24kHz; Ming-flash-omni surfaces a 44.1kHz

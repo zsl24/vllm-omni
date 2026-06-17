@@ -37,3 +37,5 @@ class ClientRequestState:
         # without re-querying stage_pools.
         self.audio_emit_stage_id: int | None = None
         self.audio_emit_replica_id: int | None = None
+        # Tracks whether the first audio chunk has been emitted (for fade-in).
+        self.audio_first_chunk: bool = True

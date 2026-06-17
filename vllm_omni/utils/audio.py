@@ -71,6 +71,71 @@ def peak_normalize(
     return audio * (target / peak)
 
 
+def _hann_fade_in(n: int) -> np.ndarray:
+    """Generate a Hann fade-in curve of length n (0→1)."""
+    if n <= 0:
+        return np.array([], dtype=np.float32)
+    t = np.arange(n, dtype=np.float32) / max(n - 1, 1)
+    return 0.5 * (1 - np.cos(np.pi * t))
+
+
+def _hann_fade_out(n: int) -> np.ndarray:
+    """Generate a Hann fade-out curve of length n (1→0)."""
+    if n <= 0:
+        return np.array([], dtype=np.float32)
+    t = np.arange(n, dtype=np.float32) / max(n - 1, 1)
+    return 0.5 * (1 + np.cos(np.pi * t))
+
+
+# ~3ms at 24kHz, enough to smooth boundary discontinuities without
+# creating audible volume dips.  Set to 0 to disable.
+DEFAULT_BLEND_SAMPLES = 64
+
+
+def apply_hann_fade_to_chunk(
+    chunk: np.ndarray,
+    is_first_chunk: bool,
+    is_last_chunk: bool = False,
+    blend_samples: int = DEFAULT_BLEND_SAMPLES,
+) -> np.ndarray:
+    """Apply Hann-window fade-in/fade-out to a streaming audio chunk.
+
+    For vllm-omni's non-overlapping contiguous chunks, this uses a pure
+    fade approach (NOT crossfade blending) to smooth boundary
+    discontinuities without losing or duplicating frames.
+
+    Qwen3-TTS uses crossfade+trim because its sliding-window re-decode
+    produces overlapping chunks where the trim removes redundant samples.
+    vllm-omni's chunked_decode_streaming produces non-overlapping chunks,
+    so trim would discard real audio content → "swallowed audio".
+
+    Every chunk receives fade-in at the head (avoids pop at audio start
+    on the first chunk; smooths boundary discontinuity on subsequent
+    chunks) and fade-out at the tail (smooths boundary on non-last
+    chunks; avoids pop on audio completion on the last chunk).
+
+    Args:
+        chunk: 1-D float32 audio array for the current chunk.
+        is_first_chunk: True if this is the first audio chunk.
+        is_last_chunk: True if this is the last audio chunk.
+        blend_samples: Number of samples for fade length.
+
+    Returns:
+        The chunk after fade processing (new array).
+    """
+    chunk = chunk.copy()
+    # Cap fade length to half the chunk to prevent overlap between
+    # the fade-in and fade-out regions on short chunks.
+    fade_len = min(blend_samples, len(chunk) // 2)
+    if fade_len <= 0:
+        return chunk
+
+    chunk[:fade_len] *= _hann_fade_in(fade_len)
+    chunk[-fade_len:] *= _hann_fade_out(fade_len)
+
+    return chunk
+
+
 def audio_chunk_pcm_bytes(omni_res: OmniRequestOutput) -> int:
     """Best-effort PCM byte count of the last audio chunk in ``omni_res``.
 
