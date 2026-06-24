@@ -37,6 +37,7 @@ from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 
 from vllm_omni.outputs import OmniModelRunnerOutput
+from vllm_omni.utils.audio import ola_crossfade_chunk
 from vllm_omni.worker.gpu_ar_model_runner import ExecuteModelState, _ensure_tensor_values
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
@@ -54,6 +55,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # Per-request OLA crossfade state: maps request_id → held-back tail
+        # for overlap-add with the next chunk's head.
+        self._audio_ola_prev_tail: dict[str, np.ndarray] = {}
         # Mirrors the init allowlist in gpu_ar_model_runner.py.
         _OMNI_CONNECTOR_INIT_ARCHS = {
             "Qwen3OmniMoeForConditionalGeneration",
@@ -76,6 +80,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         # remove requests
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
+            self._audio_ola_prev_tail.pop(req_id, None)
         scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
         cached_req_ids = self.input_batch.req_id_to_index.keys()
         resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
@@ -453,9 +458,44 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 multimodal_outputs.append(_ensure_tensor_values(mm_payload))
         else:
             raise RuntimeError("Unsupported diffusion output type")
+
         # [Omni] Copy req_id mappings to avoid async scheduling mutation.
         req_ids_output_copy = self.input_batch.req_ids.copy()
         req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
+
+        # OLA crossfade: overlap-add at chunk boundaries when async_chunk
+        # is active so all downstream consumers (HTTP, WebSocket) receive
+        # smooth audio without per-entrypoint OLA logic.
+        if self.model_config.async_chunk:
+            from vllm_omni.metrics import definitions as _metric_defs
+
+            for i, rid in enumerate(req_ids_output_copy):
+                mm = multimodal_outputs[i]
+                audio_key = "model_outputs" if "model_outputs" in mm else ("audio" if "audio" in mm else None)
+                if audio_key is None:
+                    continue
+                audio_tensor = mm.get(audio_key)
+                if audio_tensor is None:
+                    continue
+                audio_np = audio_tensor.detach().float().numpy()
+                if audio_np.ndim > 1:
+                    audio_np = audio_np.flatten()
+                audio_np = audio_np.astype(np.float32)
+                sr = _metric_defs.resolve_audio_sample_rate(mm)
+                prev_tail = self._audio_ola_prev_tail.get(rid)
+                audio_np, new_tail = ola_crossfade_chunk(
+                    chunk=audio_np,
+                    is_first_chunk=(prev_tail is None),
+                    is_last_chunk=False,
+                    sample_rate=sr,
+                    prev_tail=prev_tail,
+                )
+                if new_tail is not None:
+                    self._audio_ola_prev_tail[rid] = new_tail
+                else:
+                    self._audio_ola_prev_tail.pop(rid, None)
+                mm[audio_key] = torch.from_numpy(audio_np).reshape(1, -1)
+
         routed_experts_lists = None
         if self.routed_experts_initialized:
             routed_experts_lists = self._omni_extract_routed_experts(scheduler_output)
