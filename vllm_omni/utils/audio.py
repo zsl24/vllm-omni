@@ -71,6 +71,150 @@ def peak_normalize(
     return audio * (target / peak)
 
 
+# ── OLA crossfade for streaming audio ────────────────────────────────
+
+# Duration-based defaults so the crossfade adapts to any sample rate.
+# ~21 ms — long enough to smooth spectral discontinuities at chunk
+# boundaries while keeping the buffering delay acceptable.
+DEFAULT_OVERLAP_SECONDS = 0.0213  # 512 / 24000
+
+# ~2.7 ms short fade-in used when skipping full OLA at silent→loud
+# boundaries.  Just enough to avoid a DC-click without eating the
+# consonant onset.
+DEFAULT_ONSET_FADE_SECONDS = 0.0027  # 64 / 24000
+
+# RMS threshold below which a signal region is treated as silence.
+# When the previous chunk's tail is silent but the next chunk starts
+# loud (e.g. a consonant onset), a full OLA crossfade would suppress
+# the onset.  Skipping the crossfade preserves the signal.
+SILENCE_THRESHOLD = 0.01
+
+
+def _hann_fade_in(n: int) -> np.ndarray:
+    """Half-Hann ramp 0→1 of length *n*."""
+    if n <= 0:
+        return np.array([], dtype=np.float32)
+    t = np.arange(n, dtype=np.float32) / max(n - 1, 1)
+    return 0.5 * (1 - np.cos(np.pi * t))
+
+
+def _hann_fade_out(n: int) -> np.ndarray:
+    """Half-Hann ramp 1→0 of length *n*."""
+    if n <= 0:
+        return np.array([], dtype=np.float32)
+    t = np.arange(n, dtype=np.float32) / max(n - 1, 1)
+    return 0.5 * (1 + np.cos(np.pi * t))
+
+
+def _rms(arr: np.ndarray) -> float:
+    return float(np.sqrt(np.mean(arr.astype(np.float64) ** 2)))
+
+
+def ola_crossfade_chunk(
+    chunk: np.ndarray,
+    is_first_chunk: bool,
+    is_last_chunk: bool = False,
+    sample_rate: int = 24000,
+    prev_tail: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Overlap-add (OLA) crossfade for a streaming audio chunk.
+
+    For the first chunk, applies a fade-in ramp from zero and holds back
+    the last ``overlap_samples`` for crossfade with the next chunk.
+
+    For middle chunks, crossfades the held-back tail of the previous
+    chunk with the head of the current chunk using Hann windows, then
+    holds back the new tail.  When the previous tail is near-silence
+    but the current chunk has a strong onset, the crossfade is skipped
+    to avoid suppressing the consonant; a short fade-in is applied
+    instead.
+
+    For the last chunk, crossfades as above but does *not* hold back the
+    tail; instead applies a fade-out to avoid a pop at stream end.
+
+    Args:
+        chunk: 1-D float32/float64 audio array for the current chunk.
+        is_first_chunk: True if this is the first audio chunk.
+        is_last_chunk: True if this is the last audio chunk.
+        sample_rate: Audio sample rate in Hz.  Used to compute overlap
+            and onset-fade durations from the time-based defaults
+            (``DEFAULT_OVERLAP_SECONDS``, ``DEFAULT_ONSET_FADE_SECONDS``).
+        prev_tail: The tail buffer returned by the previous call.
+
+    Returns:
+        (output, new_tail).  *output* contains the samples to send to
+        the client.  *new_tail* is the tail buffer to pass as
+        ``prev_tail`` on the next call (``None`` for the last chunk).
+    """
+    overlap_samples = max(int(DEFAULT_OVERLAP_SECONDS * sample_rate), 1)
+    onset_fade_samples = max(int(DEFAULT_ONSET_FADE_SECONDS * sample_rate), 1)
+
+    chunk = chunk.astype(np.float32, copy=True)
+    ov = min(overlap_samples, len(chunk))
+
+    # ── First chunk ──────────────────────────────────────────────
+    if is_first_chunk or prev_tail is None:
+        chunk[:ov] *= _hann_fade_in(ov)
+        if is_last_chunk:
+            out_len = min(ov, len(chunk) // 2)
+            if out_len > 0:
+                chunk[-out_len:] *= _hann_fade_out(out_len)
+            return chunk, None
+        tail = chunk[-ov:].copy() if len(chunk) > ov else chunk.copy()
+        output = chunk[:-ov] if len(chunk) > ov else np.array([], dtype=np.float32)
+        return output, tail
+
+    # ── Middle / last chunk ──────────────────────────────────────
+    ov = min(ov, len(prev_tail))
+    tail_rms = _rms(prev_tail[-ov:])
+    head_rms = _rms(chunk[:ov])
+
+    if tail_rms < SILENCE_THRESHOLD and head_rms >= SILENCE_THRESHOLD:
+        # Silent→loud: full OLA would suppress the onset.
+        # Apply a short fade-in from the tail's last sample instead.
+        fade_len = min(onset_fade_samples, len(chunk))
+        dc_offset = float(prev_tail[-1])
+        ramp = _hann_fade_in(fade_len)
+        chunk[:fade_len] = dc_offset * (1 - ramp) + chunk[:fade_len] * ramp
+
+        if is_last_chunk:
+            out_len = min(ov, len(chunk) // 2)
+            if out_len > 0:
+                chunk[-out_len:] *= _hann_fade_out(out_len)
+            return chunk, None
+
+        if len(chunk) <= ov:
+            tail = chunk.copy()
+            return np.array([], dtype=np.float32), tail
+
+        tail = chunk[-ov:].copy()
+        output = chunk[:-ov]
+        return output, tail
+
+    # Normal OLA crossfade
+    fade_out = _hann_fade_out(ov)
+    fade_in = _hann_fade_in(ov)
+    crossfaded = prev_tail[-ov:] * fade_out + chunk[:ov] * fade_in
+
+    remainder = chunk[ov:]
+
+    if is_last_chunk:
+        out_len = min(ov, len(remainder) // 2)
+        if out_len > 0:
+            remainder[-out_len:] *= _hann_fade_out(out_len)
+        output = np.concatenate([crossfaded, remainder])
+        return output, None
+
+    # Hold back tail for next crossfade
+    if len(remainder) <= ov:
+        tail = remainder.copy()
+        return crossfaded, tail
+
+    tail = remainder[-ov:].copy()
+    output = np.concatenate([crossfaded, remainder[:-ov]])
+    return output, tail
+
+
 def audio_chunk_pcm_bytes(omni_res: OmniRequestOutput) -> int:
     """Best-effort PCM byte count of the last audio chunk in ``omni_res``.
 
