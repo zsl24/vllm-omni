@@ -15,6 +15,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.utils import coerce_param_message_types
+from vllm_omni.utils.audio import ola_crossfade_chunk
 
 logger = init_logger(__name__)
 
@@ -30,6 +31,8 @@ class RealtimeConnection(VllmRealtimeConnection):
         super().__init__(*args, **kwargs)
         self.engine = cast(AsyncOmni, self.serving.engine_client)
         self._realtime_audio_ref: np.ndarray | None = None
+        self._audio_prev_tail: np.ndarray | None = None
+        self._audio_first_chunk: bool = True
 
     async def start_generation(self):
         await super().start_generation()
@@ -129,6 +132,8 @@ class RealtimeConnection(VllmRealtimeConnection):
         prompt_token_ids_len = 0
         completion_tokens_len = 0
         self._realtime_audio_ref = None
+        self._audio_prev_tail = None
+        self._audio_first_chunk = True
 
         # Coerce cumulative outputs to delta outputs; this ensures
         # we don't emit redundant MM data & drain after emitting.
@@ -168,7 +173,20 @@ class RealtimeConnection(VllmRealtimeConnection):
 
                 audio_chunks, sample_rate = self._extract_audio_chunks(output)
 
+                is_last_audio = not self._is_connected or (
+                    getattr(output, "outputs", None)
+                    and any(o.finish_reason is not None for o in output.outputs)
+                )
                 for chunk in audio_chunks:
+                    chunk, self._audio_prev_tail = ola_crossfade_chunk(
+                        chunk=chunk,
+                        is_first_chunk=self._audio_first_chunk,
+                        is_last_chunk=is_last_audio,
+                        prev_tail=self._audio_prev_tail,
+                    )
+                    self._audio_first_chunk = False
+                    if chunk.size == 0:
+                        continue
                     sent_audio = True
                     await self.send_json(
                         {

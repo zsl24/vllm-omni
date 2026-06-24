@@ -1,5 +1,7 @@
 import asyncio
 
+import numpy as np
+
 from vllm_omni.metrics import OrchestratorAggregator
 
 
@@ -37,3 +39,7 @@ class ClientRequestState:
         # without re-querying stage_pools.
         self.audio_emit_stage_id: int | None = None
         self.audio_emit_replica_id: int | None = None
+        # OLA crossfade state for streaming audio — holds back the tail
+        # of the previous chunk to overlap-add with the next chunk.
+        self.audio_prev_tail: np.ndarray | None = None
+        self.audio_first_chunk: bool = True
