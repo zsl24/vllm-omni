@@ -77,6 +77,17 @@ def peak_normalize(
 # chunk boundaries while keeping the buffering delay acceptable.
 DEFAULT_OVERLAP_SAMPLES = 512
 
+# RMS threshold below which a signal region is treated as silence.
+# When the previous chunk's tail is silent but the next chunk starts
+# loud (e.g. a consonant onset), a full OLA crossfade would suppress
+# the onset.  Skipping the crossfade preserves the signal.
+SILENCE_THRESHOLD = 0.01
+
+# Short fade-in length used when skipping OLA at silent→loud boundaries.
+# Just enough (~2.7 ms at 24 kHz) to avoid a DC-click without eating
+# the consonant onset.
+ONSET_FADE_SAMPLES = 64
+
 
 def _hann_fade_in(n: int) -> np.ndarray:
     """Half-Hann ramp 0→1 of length *n*."""
@@ -94,6 +105,10 @@ def _hann_fade_out(n: int) -> np.ndarray:
     return 0.5 * (1 + np.cos(np.pi * t))
 
 
+def _rms(arr: np.ndarray) -> float:
+    return float(np.sqrt(np.mean(arr.astype(np.float64) ** 2)))
+
+
 def ola_crossfade_chunk(
     chunk: np.ndarray,
     is_first_chunk: bool,
@@ -108,7 +123,10 @@ def ola_crossfade_chunk(
 
     For middle chunks, crossfades the held-back tail of the previous
     chunk with the head of the current chunk using Hann windows, then
-    holds back the new tail.
+    holds back the new tail.  When the previous tail is near-silence
+    but the current chunk has a strong onset, the crossfade is skipped
+    to avoid suppressing the consonant; a short fade-in is applied
+    instead.
 
     For the last chunk, crossfades as above but does *not* hold back the
     tail; instead applies a fade-out to avoid a pop at stream end.
@@ -142,6 +160,32 @@ def ola_crossfade_chunk(
 
     # ── Middle / last chunk ──────────────────────────────────────
     ov = min(ov, len(prev_tail))
+    tail_rms = _rms(prev_tail[-ov:])
+    head_rms = _rms(chunk[:ov])
+
+    if tail_rms < SILENCE_THRESHOLD and head_rms >= SILENCE_THRESHOLD:
+        # Silent→loud: full OLA would suppress the onset.
+        # Apply a short fade-in from the tail's last sample instead.
+        fade_len = min(ONSET_FADE_SAMPLES, len(chunk))
+        dc_offset = float(prev_tail[-1])
+        ramp = _hann_fade_in(fade_len)
+        chunk[:fade_len] = dc_offset * (1 - ramp) + chunk[:fade_len] * ramp
+
+        if is_last_chunk:
+            out_len = min(ov, len(chunk) // 2)
+            if out_len > 0:
+                chunk[-out_len:] *= _hann_fade_out(out_len)
+            return chunk, None
+
+        if len(chunk) <= ov:
+            tail = chunk.copy()
+            return np.array([], dtype=np.float32), tail
+
+        tail = chunk[-ov:].copy()
+        output = chunk[:-ov]
+        return output, tail
+
+    # Normal OLA crossfade
     fade_out = _hann_fade_out(ov)
     fade_in = _hann_fade_in(ov)
     crossfaded = prev_tail[-ov:] * fade_out + chunk[:ov] * fade_in
