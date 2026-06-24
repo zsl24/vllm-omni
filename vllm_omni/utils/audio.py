@@ -73,20 +73,21 @@ def peak_normalize(
 
 # ── OLA crossfade for streaming audio ────────────────────────────────
 
-# ~21 ms at 24 kHz — long enough to smooth spectral discontinuities at
-# chunk boundaries while keeping the buffering delay acceptable.
-DEFAULT_OVERLAP_SAMPLES = 512
+# Duration-based defaults so the crossfade adapts to any sample rate.
+# ~21 ms — long enough to smooth spectral discontinuities at chunk
+# boundaries while keeping the buffering delay acceptable.
+DEFAULT_OVERLAP_SECONDS = 0.0213  # 512 / 24000
+
+# ~2.7 ms short fade-in used when skipping full OLA at silent→loud
+# boundaries.  Just enough to avoid a DC-click without eating the
+# consonant onset.
+DEFAULT_ONSET_FADE_SECONDS = 0.0027  # 64 / 24000
 
 # RMS threshold below which a signal region is treated as silence.
 # When the previous chunk's tail is silent but the next chunk starts
 # loud (e.g. a consonant onset), a full OLA crossfade would suppress
 # the onset.  Skipping the crossfade preserves the signal.
 SILENCE_THRESHOLD = 0.01
-
-# Short fade-in length used when skipping OLA at silent→loud boundaries.
-# Just enough (~2.7 ms at 24 kHz) to avoid a DC-click without eating
-# the consonant onset.
-ONSET_FADE_SAMPLES = 64
 
 
 def _hann_fade_in(n: int) -> np.ndarray:
@@ -113,7 +114,7 @@ def ola_crossfade_chunk(
     chunk: np.ndarray,
     is_first_chunk: bool,
     is_last_chunk: bool = False,
-    overlap_samples: int = DEFAULT_OVERLAP_SAMPLES,
+    sample_rate: int = 24000,
     prev_tail: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray | None]:
     """Overlap-add (OLA) crossfade for a streaming audio chunk.
@@ -135,7 +136,9 @@ def ola_crossfade_chunk(
         chunk: 1-D float32/float64 audio array for the current chunk.
         is_first_chunk: True if this is the first audio chunk.
         is_last_chunk: True if this is the last audio chunk.
-        overlap_samples: Number of samples for overlap/crossfade.
+        sample_rate: Audio sample rate in Hz.  Used to compute overlap
+            and onset-fade durations from the time-based defaults
+            (``DEFAULT_OVERLAP_SECONDS``, ``DEFAULT_ONSET_FADE_SECONDS``).
         prev_tail: The tail buffer returned by the previous call.
 
     Returns:
@@ -143,6 +146,9 @@ def ola_crossfade_chunk(
         the client.  *new_tail* is the tail buffer to pass as
         ``prev_tail`` on the next call (``None`` for the last chunk).
     """
+    overlap_samples = max(int(DEFAULT_OVERLAP_SECONDS * sample_rate), 1)
+    onset_fade_samples = max(int(DEFAULT_ONSET_FADE_SECONDS * sample_rate), 1)
+
     chunk = chunk.astype(np.float32, copy=True)
     ov = min(overlap_samples, len(chunk))
 
@@ -166,7 +172,7 @@ def ola_crossfade_chunk(
     if tail_rms < SILENCE_THRESHOLD and head_rms >= SILENCE_THRESHOLD:
         # Silent→loud: full OLA would suppress the onset.
         # Apply a short fade-in from the tail's last sample instead.
-        fade_len = min(ONSET_FADE_SAMPLES, len(chunk))
+        fade_len = min(onset_fade_samples, len(chunk))
         dc_offset = float(prev_tail[-1])
         ramp = _hann_fade_in(fade_len)
         chunk[:fade_len] = dc_offset * (1 - ramp) + chunk[:fade_len] * ramp

@@ -2504,18 +2504,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if audio_tensor.ndim > 1:
             audio_tensor = audio_tensor.flatten()
 
-        # OLA crossfade: overlap-add with the previous chunk's tail to
-        # smooth spectral discontinuities at chunk boundaries.
-        if stream and req_state is not None:
-            is_last = any(o.finish_reason is not None for o in final_res.outputs)
-            audio_tensor, req_state.audio_prev_tail = ola_crossfade_chunk(
-                chunk=audio_tensor,
-                is_first_chunk=req_state.audio_first_chunk,
-                is_last_chunk=is_last,
-                prev_tail=req_state.audio_prev_tail,
-            )
-            req_state.audio_first_chunk = False
-
         # Prefer the talker-reported sample rate when present. Qwen3-Omni
         # omits "sr" and runs at 24kHz; Ming-flash-omni surfaces a 44.1kHz
         # AudioVAE rate via multimodal_output["sr"].
@@ -2528,6 +2516,19 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             sample_rate = int(sr_raw.item())
         else:
             sample_rate = int(sr_raw)
+
+        # OLA crossfade: overlap-add with the previous chunk's tail to
+        # smooth spectral discontinuities at chunk boundaries.
+        if stream and req_state is not None:
+            is_last = any(o.finish_reason is not None for o in final_res.outputs)
+            audio_tensor, req_state.audio_prev_tail = ola_crossfade_chunk(
+                chunk=audio_tensor,
+                is_first_chunk=req_state.audio_first_chunk,
+                is_last_chunk=is_last,
+                sample_rate=sample_rate,
+                prev_tail=req_state.audio_prev_tail,
+            )
+            req_state.audio_first_chunk = False
 
         audio_obj = CreateAudio(
             audio_tensor=audio_tensor,

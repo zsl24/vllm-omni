@@ -182,6 +182,7 @@ class RealtimeConnection(VllmRealtimeConnection):
                         chunk=chunk,
                         is_first_chunk=self._audio_first_chunk,
                         is_last_chunk=is_last_audio,
+                        sample_rate=sample_rate,
                         prev_tail=self._audio_prev_tail,
                     )
                     self._audio_first_chunk = False
