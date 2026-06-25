@@ -93,6 +93,7 @@ from vllm.tool_parsers.mistral_tool_parser import MistralToolCall
 from vllm.utils.collection_utils import as_list
 from vllm.v1.engine.exceptions import EngineDeadError
 
+from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.image_api_utils import encode_image_base64_with_compression, validate_layered_layers
 from vllm_omni.entrypoints.openai.protocol import OmniChatCompletionStreamResponse
@@ -120,7 +121,6 @@ from vllm_omni.errors import OmniClientError
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.audio import audio_chunk_pcm_bytes, audio_chunk_sample_rate, ola_crossfade_chunk
-from vllm_omni.entrypoints.client_request_state import ClientRequestState
 
 logger = init_logger(__name__)
 
@@ -2478,7 +2478,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         return choices, usage, prompt_logprobs, prompt_token_ids, kv_transfer_params
 
     def _create_audio_choice(
-        self, omni_outputs: OmniRequestOutput, role: str, request: ChatCompletionRequest, stream: bool = False,
+        self,
+        omni_outputs: OmniRequestOutput,
+        role: str,
+        request: ChatCompletionRequest,
+        stream: bool = False,
         req_state: ClientRequestState | None = None,
     ):
         choices: list[ChatCompletionResponseChoice] = []

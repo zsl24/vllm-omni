@@ -174,8 +174,7 @@ class RealtimeConnection(VllmRealtimeConnection):
                 audio_chunks, sample_rate = self._extract_audio_chunks(output)
 
                 is_last_audio = not self._is_connected or (
-                    getattr(output, "outputs", None)
-                    and any(o.finish_reason is not None for o in output.outputs)
+                    getattr(output, "outputs", None) and any(o.finish_reason is not None for o in output.outputs)
                 )
                 for chunk in audio_chunks:
                     chunk, self._audio_prev_tail = ola_crossfade_chunk(
